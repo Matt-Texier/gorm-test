@@ -9,6 +9,27 @@ import (
 	"sync"
 )
 
+type UserSnmpConfig struct {
+	gorm.Model
+	ManagedRouterID    uint   `json:"-"` // one relationship
+	Network            string `json:"snmp_network,omitempty"`
+	Address            string `json:"snmp_address,omitempty"`
+	Timeout            string `json:"snmp_timeout,omitempty"`
+	Retries            string `json:"snmp_retries,omitempty"`
+	MessageMaxSize     string `json:"snmp_message_size,omitempty"`
+	Version            string `json:"snmp_version,omitempty"`
+	V2Community        string `json:"snmpv2_community,omitempty"`
+	V3UserName         string `json:"snmpv3_user_name,omitempty"`
+	V3SecurityLevel    string `json:"snmpv3_security_level,omitempty"`
+	V3AuthPassword     string `json:"snmpv3_auth_passwd,omitempty"`
+	V3AuthProtocol     string `json:"snmpv3_auth_proto,omitempty"`
+	V3PrivPassword     string `json:"snmpv3_priv_password,omitempty"`
+	V3PrivProtocol     string `json:"snmpv3_priv_proto,omitempty"`
+	V3SecurityEngineId string `json:"snmpv3_sec_engine_id,omitempty"`
+	V3ContextEngineId  string `json:"snmpv3_context_engine_id,omitempty"`
+	V3ContextName      string `json:"snmpv3_context_name,omitempty"`
+}
+
 // structure to receive interface data
 type ManagedInterface struct {
 	gorm.Model
@@ -34,8 +55,9 @@ type ManagedRouter struct {
 	BulkMaxRepetition int                 `json:"rtr_bulk_max_rep,omitempty"`
 	FlowSourceIP      string              `json:"rtr_flow_src_ip,omitempty" sql:"type:inet;"`
 	PollingInterval   string              `json:"rtr_polling_interval,omitempty" gorm:"type:varchar(10)"`
-	ManagedInterfaces []*ManagedInterface `json:"rtr_if_table"` // has many relations with interfaces
-	WaitWriter        sync.WaitGroup      `json:"-" sql:"-"`    // wait group to avoid race condition
+	SnmpConfig        *UserSnmpConfig     `json:"rtr_snmp_config,omitempty" gorm:"foreignkey:ManagedRouterID"` // has one relation
+	ManagedInterfaces []*ManagedInterface `json:"rtr_if_table" gorm:"foreignkey:ManagedRouterID"`              // has many relations with interfaces
+	WaitWriter        sync.WaitGroup      `json:"-" sql:"-"`                                                   // wait group to avoid race condition
 }
 
 var someTestRouters = []*ManagedRouter{
@@ -52,6 +74,12 @@ var someTestRouters = []*ManagedRouter{
 			{Name: "alu-01-int-01"},
 			{Name: "alu-01-int-02"},
 		},
+		SnmpConfig: &UserSnmpConfig{
+			Network:     "udp",
+			Address:     "10.0.1.1",
+			Version:     "v2c",
+			V2Community: "public",
+		},
 	},
 	{
 		UniqueName:        "alu-02",
@@ -66,6 +94,12 @@ var someTestRouters = []*ManagedRouter{
 			{Name: "alu-02-int-01"},
 			{Name: "alu-02-int-02"},
 		},
+		SnmpConfig: &UserSnmpConfig{
+			Network:     "udp",
+			Address:     "10.0.1.2",
+			Version:     "v2c",
+			V2Community: "public",
+		},
 	},
 	{
 		UniqueName:        "vxr-01",
@@ -79,6 +113,12 @@ var someTestRouters = []*ManagedRouter{
 		ManagedInterfaces: []*ManagedInterface{
 			{Name: "vrx-01-int-01"},
 			{Name: "vrx-01-int-02"},
+		},
+		SnmpConfig: &UserSnmpConfig{
+			Network:     "udp",
+			Address:     "10.0.1.3",
+			Version:     "v2c",
+			V2Community: "public",
 		},
 	},
 }
@@ -96,17 +136,34 @@ func main() {
 		db.AutoMigrate(&ManagedInterface{})
 		db.Model(&ManagedRouter{}).Related(&ManagedInterface{})
 	}
+	if !db.HasTable(&UserSnmpConfig{}) {
+		db.AutoMigrate(&UserSnmpConfig{})
+		db.Model(&ManagedRouter{}).Related(&UserSnmpConfig{})
+	}
 	UpdateRouterDbTable(db, someTestRouters)
 	SyncMemRoutersWithDb(db, someTestRouters)
-	_, routersFromDb := CreateMemRoutersFromDb(db)
-	for i := 0; i < len(routersFromDb); i++ {
-		routersFromDb[i].CreateInterfaceFromDB(db)
-	}
-	for i, router := range routersFromDb {
+	_, routersConfig := LoadRoutersConfigFromDb(db)
+	for i, router := range routersConfig {
 		fmt.Println("router ", i, ":", router)
+		fmt.Println("interfaces: ", router.ManagedInterfaces)
+		fmt.Println("SNMP config: ", router.SnmpConfig)
+	}
+	fmt.Println("#######################################################################")
+	_, routersFull := LoadRoutersConfigFromDb(db)
+	for i, router := range routersFull {
+		fmt.Println("router ", i, ":", router)
+		fmt.Println("interfaces: ", router.ManagedInterfaces)
+		fmt.Println("SNMP config: ", router.SnmpConfig)
 	}
 	db.Close()
 }
+
+// This function updates postGRE router table from router table in memory
+// Once done it also make sure that memory structure are in sync with data
+// stored in the db (primary key and other fields created by the ORM
+// It pushes as well all related structures (interfaces and snmp config) and sync it
+// as well if routers has never been stored it creates all tables entries
+// (this should in theory never happen but could be useful for test purposes)
 
 func UpdateRouterDbTable(db *gorm.DB, myRouters []*ManagedRouter) error {
 	var count int
@@ -151,15 +208,25 @@ func SyncMemRoutersWithDb(db *gorm.DB, myRouters []*ManagedRouter) error {
 	return nil
 }
 
-func CreateMemRoutersFromDb(db *gorm.DB) (error, []*ManagedRouter) {
+func LoadRoutersConfigFromDb(db *gorm.DB) (error, []*ManagedRouter) {
 	var count int
 	var returnedRouters []*ManagedRouter
 	db.Model(&ManagedRouter{}).Count(&count)
-	fmt.Println("count: ", count)
 	if count == 0 {
 		return fmt.Errorf("no router in db"), nil
 	}
-	db.Model(&ManagedRouter{}).Find(&returnedRouters)
+	db.Model(&ManagedRouter{}).Preload("SnmpConfig").Find(&returnedRouters)
+	return nil, returnedRouters
+}
+
+func LoadFullRoutersFromDb(db *gorm.DB) (error, []*ManagedRouter) {
+	var count int
+	var returnedRouters []*ManagedRouter
+	db.Model(&ManagedRouter{}).Count(&count)
+	if count == 0 {
+		return fmt.Errorf("no router in db"), nil
+	}
+	db.Model(&ManagedRouter{}).Preload("SnmpConfig").Preload("ManagedInterfaces").Find(&returnedRouters)
 	return nil, returnedRouters
 }
 
@@ -211,4 +278,20 @@ func (myRouter *ManagedRouter) CreateInterfaceFromDB(db *gorm.DB) error {
 		ManagedRouterID: myRouter.ID,
 	}).Find(&myRouter.ManagedInterfaces)
 	return nil
+}
+
+func (myRouter *ManagedRouter) CreateSnmpUserConfFromDb(db *gorm.DB) error {
+	myUserSnmp := NewSnmpStruc()
+	if myRouter.ID == 0 {
+		return fmt.Errorf("router is missing a primary key")
+	}
+	db.Model(&UserSnmpConfig{}).Where(&UserSnmpConfig{
+		ManagedRouterID: myRouter.ID,
+	}).Find(myUserSnmp)
+	myRouter.SnmpConfig = myUserSnmp
+	return nil
+}
+
+func NewSnmpStruc() *UserSnmpConfig {
+	return &UserSnmpConfig{}
 }
