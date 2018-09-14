@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
+	"github.com/k-sone/snmpgo"
 	"math"
 	"os"
 	"sync"
+	"time"
 )
 
 type UserSnmpConfig struct {
@@ -31,33 +33,67 @@ type UserSnmpConfig struct {
 }
 
 // structure to receive interface data
+type IfCounters struct {
+	LocalTimestamp   time.Time `json:"local-time,omitempty"`
+	RemoteTimestamp  string    `json:"remote-time,omitempty"`
+	InOctets         uint64    `json:"in-octets,omitempty"`
+	InUcastPkts      uint64    `json:"in-unicast-pkts,omitempty"`
+	InMulticastPkts  uint64    `json:"in-multicast-pkts,omitempty"`
+	InBroadcastPkts  uint64    `json:"in-broadcast-pkts,omitempty"`
+	OutOctets        uint64    `json:"out-octets,omitempty"`
+	OutUcastPkts     uint64    `json:"out-unicast_pkts,omitempty"`
+	OutMulticastPkts uint64    `json:"out-multicast-pkts,omitempty"`
+	OutBroadcastPkts uint64    `json:"out-broadcast-pkts,omitempty"`
+	NextCounters     *IfCounters
+}
+
+// structure to receive interface data
 type ManagedInterface struct {
 	gorm.Model
-	ManagedRouterID uint   `json:"-"` // one to many relationship
-	Name            string `json:"name,omitempty" gorm:"type:varchar(150)"`
-	Alias           string `json:"description,omitempty" gorm:"type:varchar(250)"`
-	HSpeed          uint64 `json:"speed,omitempty"`
-	Index           int32  `json:"if-index,omitempty"`
+	ManagedRouterID uint        `json:"-"` // one to many relationship
+	Name            string      `json:"name,omitempty" gorm:"type:varchar(255)"`
+	Alias           string      `json:"description,omitempty"  gorm:"type:varchar(255)"`
+	HSpeed          uint64      `json:"speed,omitempty"`
+	Index           int32       `json:"if-index,omitempty"`
+	Statistics      *IfCounters `json:"statistics,omitempty" gorm:"-"`
 }
+
+type InterfacesIndexType map[int32]*ManagedInterface
 
 // object/structure to store routers information
 // FlowSourceIP is PMACCT field: source IP of netflow packets
 type ManagedRouter struct {
 	gorm.Model
-	UniqueName        string              `json:"rtr_unique_name,omitempty" gorm:"type:varchar(150);unique_index"`
-	Description       string              `json:"rtr_description,omitempty"`
-	UpTime            string              `json:"rtr_up_time,omitempty"`
-	Contact           string              `json:"rtr_contact,omitempty" gorm:"type:varchar(150)"`
-	Name              string              `json:"rtr_name,omitempty" gorm:"type:varchar(150)"`
-	Location          string              `json:"rtr_location,omitempty" gorm:"type:varchar(150)"`
-	Lon               float64             `json:"rtr_lon,omitempty"`
-	Lat               float64             `json:"rtr_lat,omitempty"`
-	BulkMaxRepetition int                 `json:"rtr_bulk_max_rep,omitempty"`
-	FlowSourceIP      string              `json:"rtr_flow_src_ip,omitempty" sql:"type:inet;"`
-	PollingInterval   string              `json:"rtr_polling_interval,omitempty" gorm:"type:varchar(10)"`
-	SnmpConfig        *UserSnmpConfig     `json:"rtr_snmp_config,omitempty" gorm:"foreignkey:ManagedRouterID"` // has one relation
-	ManagedInterfaces []*ManagedInterface `json:"rtr_if_table" gorm:"foreignkey:ManagedRouterID"`              // has many relations with interfaces
-	WaitWriter        sync.WaitGroup      `json:"-" sql:"-"`                                                   // wait group to avoid race condition
+	UniqueName        string                `json:"rtr_unique_name,omitempty" gorm:"type:varchar(150);unique_index"`
+	Description       string                `json:"rtr_description,omitempty" gorm:"type:varchar(255)"`
+	UpTime            string                `json:"rtr_up_time,omitempty" gorm:"type:varchar(100)"`
+	Contact           string                `json:"rtr_contact,omitempty" gorm:"type:varchar(100)"`
+	Name              string                `json:"rtr_name,omitempty" gorm:"type:varchar(150)"`
+	Location          string                `json:"rtr_location,omitempty" gorm:"type:varchar(150)"`
+	Lon               float64               `json:"rtr_lon,omitempty"`
+	Lat               float64               `json:"rtr_lat,omitempty"`
+	BulkMaxRepetition int                   `json:"rtr_bulk_max_rep,omitempty"`
+	FlowSourceIP      string                `json:"rtr_flow_src_ip,omitempty" sql:"type:inet;" `
+	PollingInterval   string                `json:"rtr_polling_interval,omitempty" gorm:"type:varchar(20)"`
+	SnmpConfig        *UserSnmpConfig       `json:"rtr_snmp_config,omitempty"  gorm:"foreignkey:ManagedRouterID"`
+	SnmpArg           *snmpgo.SNMPArguments `json:"-" gorm:"-"`
+	InterfacesIndex   InterfacesIndexType   `json:"-" gorm:"-"`
+	ManagedInterfaces []*ManagedInterface   `json:"-" gorm:"foreignkey:ManagedRouterID"` // has many relations with interfaces
+	WaitWriter        sync.WaitGroup        `json:"-" gorm:"-"`                          // wait group to avoid race condition
+	Quit              chan bool             `json:"-" gorm:"-"`                          // channel used to send exit signal to snmp poller from the orchestrator
+}
+
+const (
+	IF_REMOVE = iota
+	IF_RELOAD
+	IF_CREATE
+	IF_UNTOUCH
+)
+
+type InterfaceDiff struct {
+	Action          int
+	IfMibSliceIndex int
+	IfDbSliceIndex  int
 }
 
 var someTestRouters = []*ManagedRouter{
@@ -71,8 +107,9 @@ var someTestRouters = []*ManagedRouter{
 		BulkMaxRepetition: 10,
 		FlowSourceIP:      "10.0.1.1",
 		ManagedInterfaces: []*ManagedInterface{
-			{Name: "alu-01-int-01"},
-			{Name: "alu-01-int-02"},
+			someTestInterfaces[0],
+			someTestInterfaces[1],
+			someTestInterfaces[2],
 		},
 		SnmpConfig: &UserSnmpConfig{
 			Network:     "udp",
@@ -91,8 +128,9 @@ var someTestRouters = []*ManagedRouter{
 		BulkMaxRepetition: 10,
 		FlowSourceIP:      "10.0.1.2",
 		ManagedInterfaces: []*ManagedInterface{
-			{Name: "alu-02-int-01"},
-			{Name: "alu-02-int-02"},
+			someTestInterfaces[3],
+			someTestInterfaces[4],
+			someTestInterfaces[5],
 		},
 		SnmpConfig: &UserSnmpConfig{
 			Network:     "udp",
@@ -111,8 +149,9 @@ var someTestRouters = []*ManagedRouter{
 		BulkMaxRepetition: 10,
 		FlowSourceIP:      "10.0.1.3",
 		ManagedInterfaces: []*ManagedInterface{
-			{Name: "vrx-01-int-01"},
-			{Name: "vrx-01-int-02"},
+			someTestInterfaces[6],
+			someTestInterfaces[7],
+			someTestInterfaces[8],
 		},
 		SnmpConfig: &UserSnmpConfig{
 			Network:     "udp",
@@ -120,6 +159,81 @@ var someTestRouters = []*ManagedRouter{
 			Version:     "v2c",
 			V2Community: "public",
 		},
+	},
+}
+
+var someTestInterfaces = []*ManagedInterface{
+	{
+		ManagedRouterID: someTestRouters[0].ID,
+		Alias:           "interface 1",
+		HSpeed:          10,
+		Name:            "1/1/1",
+		Index:           1,
+		Statistics:      nil,
+	},
+	{
+		ManagedRouterID: someTestRouters[0].ID,
+		Alias:           "interface 2",
+		HSpeed:          20,
+		Name:            "2/2/2",
+		Index:           2,
+		Statistics:      nil,
+	},
+	{
+		ManagedRouterID: someTestRouters[0].ID,
+		Alias:           "interface 3",
+		HSpeed:          30,
+		Name:            "3/3/3",
+		Index:           3,
+		Statistics:      nil,
+	},
+	{
+		ManagedRouterID: someTestRouters[1].ID,
+		Alias:           "interface 1",
+		HSpeed:          10,
+		Name:            "1/1/1",
+		Index:           1,
+		Statistics:      nil,
+	},
+	{
+		ManagedRouterID: someTestRouters[1].ID,
+		Alias:           "interface 2",
+		HSpeed:          20,
+		Name:            "2/2/2",
+		Index:           2,
+		Statistics:      nil,
+	},
+	{
+		ManagedRouterID: someTestRouters[1].ID,
+		Alias:           "interface 3",
+		HSpeed:          30,
+		Name:            "3/3/3",
+		Index:           3,
+		Statistics:      nil,
+	},
+	{
+		ManagedRouterID: someTestRouters[2].ID,
+		Alias:           "interface 1",
+		HSpeed:          10,
+		Name:            "1/1/1",
+		Index:           1,
+		Statistics:      nil,
+	},
+	{
+		ManagedRouterID: someTestRouters[2].ID,
+		Alias:           "interface 2",
+		HSpeed:          20,
+		Name:            "2/2/2",
+		Index:           2,
+		Statistics:      nil,
+	},
+	{
+		ManagedRouterID: someTestRouters[2].ID,
+		Alias:           "interface 3",
+		HSpeed:          30,
+		Name:            "3/3/3",
+		Index:           3,
+		Statistics:      nil,
 	},
 }
 
@@ -140,10 +254,10 @@ func main() {
 		db.AutoMigrate(&UserSnmpConfig{})
 		db.Model(&ManagedRouter{}).Related(&UserSnmpConfig{})
 	}
-	UpdateRouterDbTable(db, someTestRouters)
-	SyncMemRoutersWithDb(db, someTestRouters)
-	_, routersConfig := LoadRoutersConfigFromDb(db)
-	for i, router := range routersConfig {
+	// UpdateRouterDbTable(db, someTestRouters)
+	// SyncMemRoutersWithDb(db, someTestRouters)
+	PushRouterToDb(db, someTestRouters)
+	for i, router := range someTestRouters {
 		fmt.Println("router ", i, ":", router)
 		fmt.Println("interfaces: ", router.ManagedInterfaces)
 		fmt.Println("SNMP config: ", router.SnmpConfig)
@@ -165,9 +279,8 @@ func main() {
 // as well if routers has never been stored it creates all tables entries
 // (this should in theory never happen but could be useful for test purposes)
 
-func UpdateRouterDbTable(db *gorm.DB, myRouters []*ManagedRouter) error {
+func PushRouterToDb(db *gorm.DB, myRouters []*ManagedRouter) error {
 	var count int
-	var routerSearch []ManagedRouter
 	db.Model(&ManagedRouter{}).Count(&count)
 	// router table is empty we fulfil it with routers in memory
 	if count == 0 {
@@ -179,15 +292,6 @@ func UpdateRouterDbTable(db *gorm.DB, myRouters []*ManagedRouter) error {
 		err := SyncMemRoutersWithDb(db, myRouters)
 		if err != nil {
 			return err
-		}
-	} else {
-		for i, router := range myRouters {
-			db.Where(&ManagedRouter{
-				UniqueName: router.UniqueName,
-			}).Find(&routerSearch)
-			if !CompareRouter(routerSearch[0], *router) {
-				myRouters[i].Copy(&routerSearch[0])
-			}
 		}
 	}
 	return nil
@@ -294,4 +398,114 @@ func (myRouter *ManagedRouter) CreateSnmpUserConfFromDb(db *gorm.DB) error {
 
 func NewSnmpStruc() *UserSnmpConfig {
 	return &UserSnmpConfig{}
+}
+
+func (myRouter *ManagedRouter) PushUpdateRouterInterface(db *gorm.DB) error {
+	var myRouterDbInterfaces []*ManagedInterface
+	db.Model(&ManagedInterface{}).Where(&ManagedInterface{
+		ManagedRouterID: myRouter.ID,
+	}).Find(&myRouterDbInterfaces)
+	interfaceDiff, err := DiffIfMibFromDbInterface(myRouter.ManagedInterfaces, myRouterDbInterfaces)
+	if err != nil {
+		fmt.Printf("Diff failed")
+	}
+	for _, myDiff := range interfaceDiff {
+		switch myDiff.Action {
+		case IF_CREATE:
+			{
+				db.Model(&ManagedInterface{}).Create(myRouter.ManagedInterfaces[myDiff.IfMibSliceIndex])
+			}
+		case IF_RELOAD:
+			{
+				db.Model(&ManagedInterface{}).Save(myRouter.ManagedInterfaces[myDiff.IfMibSliceIndex])
+			}
+		case IF_UNTOUCH:
+			{
+				fmt.Println("skip interface", myRouter.ManagedInterfaces[myDiff.IfMibSliceIndex].Name)
+			}
+		case IF_REMOVE:
+			{
+				db.Model(&ManagedInterface{}).Delete(myRouterDbInterfaces[myDiff.IfDbSliceIndex])
+			}
+		default:
+			{
+				fmt.Println("wrong diff action")
+			}
+		}
+	}
+	return nil
+}
+
+func DiffIfMibFromDbInterface(IfsMib []*ManagedInterface,
+	IfsDb []*ManagedInterface) ([]*InterfaceDiff, error) {
+	var returnDiff []*InterfaceDiff
+	// simple situation where interface router db is empty
+	if len(IfsDb) == 0 {
+		for i, _ := range IfsMib {
+			returnDiff = append(returnDiff, NewDiffInterface(IF_CREATE, i, -1))
+		}
+		return returnDiff, nil
+	}
+	for i, myIfMib := range IfsMib {
+		indexIfDb := findInterfaceInSlice(IfsDb, myIfMib)
+		if indexIfDb != -1 { // we found the same If in the db
+			// we check if data in db diff that data in mib
+			isTheSame := compareInterface(myIfMib, IfsDb[indexIfDb])
+			if isTheSame { // interface hasn't change
+				returnDiff = append(returnDiff, NewDiffInterface(IF_UNTOUCH, i, indexIfDb))
+			} else {
+				returnDiff = append(returnDiff, NewDiffInterface(IF_RELOAD, i, indexIfDb))
+			}
+
+		} else { // interface in mib is not in interface in db
+			returnDiff = append(returnDiff, NewDiffInterface(IF_CREATE, i, indexIfDb))
+		}
+	}
+	// we went through the whole mib if and elaborate diff with db if
+	// Now we need to check if mib interfaces has been removed since last db update
+	if len(returnDiff) < len(IfsDb) {
+		stillPresentIfs := make([]bool, len(IfsDb))
+		for i := 0; i < len(stillPresentIfs); i++ {
+			stillPresentIfs[i] = false
+		}
+		for i, myDbIf := range IfsDb {
+			indexIfDb := findInterfaceInSlice(IfsMib, myDbIf)
+			if indexIfDb == -1 {
+				stillPresentIfs[i] = false
+			} else {
+				stillPresentIfs[i] = true
+			}
+		}
+		for i := 0; i < len(stillPresentIfs); i++ {
+			if stillPresentIfs[i] == false {
+				returnDiff = append(returnDiff, NewDiffInterface(IF_REMOVE, -1, i))
+			}
+		}
+	}
+	return returnDiff, nil
+}
+
+func compareInterface(myInterfaceA *ManagedInterface, myInterfaceB *ManagedInterface) bool {
+	return myInterfaceA.ManagedRouterID == myInterfaceB.ManagedRouterID &&
+		myInterfaceA.HSpeed == myInterfaceB.HSpeed &&
+		myInterfaceA.Alias == myInterfaceB.Alias &&
+		myInterfaceA.Name == myInterfaceB.Name &&
+		myInterfaceA.Index == myInterfaceB.Index
+}
+
+func findInterfaceInSlice(myIfSlice []*ManagedInterface, myInterface *ManagedInterface) int {
+	for i, myInterfaceFromSlice := range myIfSlice {
+		if compareInterface(myInterfaceFromSlice, myInterface) {
+			return i
+		}
+	}
+	return -1
+}
+
+func NewDiffInterface(myAction int, myIfMibSliceIndex int, myIfDbSliceIndex int) *InterfaceDiff {
+	return &InterfaceDiff{
+		Action:          myAction,
+		IfDbSliceIndex:  myIfDbSliceIndex,
+		IfMibSliceIndex: myIfMibSliceIndex,
+	}
 }
